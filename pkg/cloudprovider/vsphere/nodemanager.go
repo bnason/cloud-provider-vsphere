@@ -294,34 +294,40 @@ func (nm *NodeManager) DiscoverNode(nodeID string, searchBy cm.FindVM) error {
 
 	for _, ipFamily := range ipFamilies {
 		klog.V(6).Infof("ipFamily: %q nonLocalhostIPs: %q", ipFamily, nonLocalhostIPs)
-		discoveredInternal, discoveredExternal := discoverIPs(
+		discoveredInternal := discoverIPs(
 			nonLocalhostIPs,
 			ipFamily,
 			internalNetworkSubnets,
-			externalNetworkSubnets,
 			excludeInternalNetworkSubnets,
-			excludeExternalNetworkSubnets,
 			internalVMNetworkName,
-			externalVMNetworkName,
 		)
 
-		klog.V(6).Infof("ipFamily: %q discovered Internal: %q discoveredExternal: %q",
-			ipFamily, discoveredInternal, discoveredExternal)
+		klog.V(6).Infof("ipFamily: %q discovered Internal: %q", ipFamily, discoveredInternal)
 
-		if discoveredInternal != nil {
+		for _, item := range discoveredInternal {
 			v1helper.AddToNodeAddresses(&addrs,
-				v1.NodeAddress{Type: v1.NodeInternalIP, Address: discoveredInternal.ipAddr},
+				v1.NodeAddress{Type: v1.NodeInternalIP, Address: item.ipAddr},
 			)
 		}
 
-		if discoveredExternal != nil {
+		discoveredExternal := discoverIPs(
+			nonLocalhostIPs,
+			ipFamily,
+			externalNetworkSubnets,
+			excludeExternalNetworkSubnets,
+			externalVMNetworkName,
+		)
+
+		klog.V(6).Infof("ipFamily: %q discovered External: %q", ipFamily, discoveredExternal)
+
+		for _, item := range discoveredExternal {
 			v1helper.AddToNodeAddresses(&addrs,
-				v1.NodeAddress{Type: v1.NodeExternalIP, Address: discoveredExternal.ipAddr},
+				v1.NodeAddress{Type: v1.NodeExternalIP, Address: item.ipAddr},
 			)
 		}
 
 		if len(oVM.Guest.Net) > 0 {
-			if discoveredInternal == nil && discoveredExternal == nil {
+			if len(discoveredInternal) == 0 && len(discoveredExternal) == 0 {
 				klog.V(4).Infof("oVM.Guest.Net=%v", oVM.Guest.Net)
 				return fmt.Errorf("unable to find suitable IP address for node %s with IP family %s", nodeID, ipFamilies)
 			}
@@ -375,69 +381,46 @@ func (nm *NodeManager) DiscoverNode(nodeID string, searchBy cm.FindVM) error {
 //
 // If either of these IPs cannot be discovered, nil will be returned instead.
 func discoverIPs(ipAddrNetworkNames []*ipAddrNetworkName, ipFamily string,
-	internalNetworkSubnets, externalNetworkSubnets,
-	excludeInternalNetworkSubnets, excludeExternalNetworkSubnets []*net.IPNet,
-	internalVMNetworkName, externalVMNetworkName string) (internal *ipAddrNetworkName, external *ipAddrNetworkName) {
+	networkSubnets, excludeNetworkSubnets []*net.IPNet,
+	VMNetworkName string) (discovered []*ipAddrNetworkName) {
 
 	ipFamilyMatches := collectMatchesForIPFamily(ipAddrNetworkNames, ipFamily)
 
-	var discoveredInternal *ipAddrNetworkName
-	var discoveredExternal *ipAddrNetworkName
+	filteredMatches := filterSubnetExclusions(ipFamilyMatches, excludeNetworkSubnets)
 
-	filteredInternalMatches := filterSubnetExclusions(ipFamilyMatches, excludeInternalNetworkSubnets)
-	filteredExternalMatches := filterSubnetExclusions(ipFamilyMatches, excludeExternalNetworkSubnets)
-
-	if len(filteredInternalMatches) > 0 || len(filteredExternalMatches) > 0 {
-		discoveredInternal = findSubnetMatch(filteredInternalMatches, internalNetworkSubnets)
-		if discoveredInternal != nil {
-			klog.V(2).Infof("Adding Internal IP by AddressMatching: %s", discoveredInternal.ipAddr)
-		}
-		discoveredExternal = findSubnetMatch(filteredExternalMatches, externalNetworkSubnets)
-		if discoveredExternal != nil {
-			klog.V(2).Infof("Adding External IP by AddressMatching: %s", discoveredExternal.ipAddr)
+	if len(filteredMatches) > 0 {
+		discovered = findSubnetMatches(filteredMatches, networkSubnets)
+		for _, item := range discovered {
+			klog.V(2).Infof("Adding Internal IP by AddressMatching: %s", item.ipAddr)
 		}
 
-		if discoveredInternal == nil && internalVMNetworkName != "" {
-			discoveredInternal = findNetworkNameMatch(filteredInternalMatches, internalVMNetworkName)
-			if discoveredInternal != nil {
-				klog.V(2).Infof("Adding Internal IP by NetworkName: %s", discoveredInternal.ipAddr)
-			}
-		}
-
-		if discoveredExternal == nil && externalVMNetworkName != "" {
-			discoveredExternal = findNetworkNameMatch(filteredExternalMatches, externalVMNetworkName)
-			if discoveredExternal != nil {
-				klog.V(2).Infof("Adding External IP by NetworkName: %s", discoveredExternal.ipAddr)
+		if len(discovered) == 0 && VMNetworkName != "" {
+			discovered = findNetworkNameMatches(filteredMatches, VMNetworkName)
+			for _, item := range discovered {
+				klog.V(2).Infof("Adding Internal IP by NetworkName: %s", item.ipAddr)
 			}
 		}
 
 		// Neither internal or external addresses were found. This defaults to the legacy
 		// address selection behavior which is to only support a single address and
 		// return the first one found
-		if discoveredInternal == nil && discoveredExternal == nil {
+		if discovered == nil {
 			klog.V(5).Info("Default address selection.")
-			if len(filteredInternalMatches) > 0 {
-				klog.V(2).Infof("Adding Internal IP: %s", filteredInternalMatches[0].ipAddr)
-				discoveredInternal = filteredInternalMatches[0]
-			}
-
-			if len(filteredExternalMatches) > 0 {
-				klog.V(2).Infof("Adding External IP: %s", filteredExternalMatches[0].ipAddr)
-				discoveredExternal = filteredExternalMatches[0]
+			for _, item := range filteredMatches {
+				klog.V(2).Infof("Adding IP: %s", item.ipAddr)
+				discovered = filteredMatches
 			}
 		} else {
 			// At least one of the Internal or External addresses has been found.
 			// Minimally the Internal needs to exist for the node to function correctly.
 			// If only one was discovered, will log the warning and continue which will
 			// ultimately be visible to the end user
-			if discoveredInternal != nil && discoveredExternal == nil {
-				klog.Warning("Internal address found, but external address not found. Returning what addresses were discovered.")
-			} else if discoveredInternal == nil && discoveredExternal != nil {
-				klog.Warning("External address found, but internal address not found. Returning what addresses were discovered.")
+			if len(discovered) == 0 {
+				klog.Warning("No address were found.")
 			}
 		}
 	}
-	return discoveredInternal, discoveredExternal
+	return discovered
 }
 
 // collectNonVNICDevices filters out NICs that are virtual NIC devices. The IPs of
@@ -540,11 +523,36 @@ func findSubnetMatch(ipAddrNetworkNames []*ipAddrNetworkName, networkSubnets []*
 	return nil
 }
 
+// findSubnetMatch finds the first *ipAddrNetworkName that has an IP in the
+// given network subnets.
+func findSubnetMatches(ipAddrNetworkNames []*ipAddrNetworkName, networkSubnets []*net.IPNet) []*ipAddrNetworkName {
+	for _, networkSubnet := range networkSubnets {
+		match := find(ipAddrNetworkNames, func(candidate *ipAddrNetworkName) bool {
+			return networkSubnet.Contains(candidate.ip())
+		})
+
+		if match != nil {
+			return match
+		}
+	}
+	return nil
+}
+
 // findNetworkNameMatch finds the first *ipAddrNetworkName that matches the
 // given network name, ignoring case.
 func findNetworkNameMatch(ipAddrNetworkNames []*ipAddrNetworkName, networkName string) *ipAddrNetworkName {
 	if networkName != "" {
 		return findFirst(ipAddrNetworkNames, func(candidate *ipAddrNetworkName) bool {
+			return strings.EqualFold(networkName, candidate.networkName)
+		})
+	}
+	return nil
+}
+
+// TODO: comment
+func findNetworkNameMatches(ipAddrNetworkNames []*ipAddrNetworkName, networkName string) []*ipAddrNetworkName {
+	if networkName != "" {
+		return find(ipAddrNetworkNames, func(candidate *ipAddrNetworkName) bool {
 			return strings.EqualFold(networkName, candidate.networkName)
 		})
 	}
@@ -559,6 +567,16 @@ func findFirst(ipAddrNetworkNames []*ipAddrNetworkName, predicate func(*ipAddrNe
 		}
 	}
 	return nil
+}
+
+// TODO: comment
+func find(ipAddrNetworkNames []*ipAddrNetworkName, predicate func(*ipAddrNetworkName) bool) (ipAddrNetworkNameMatches []*ipAddrNetworkName) {
+	for _, item := range ipAddrNetworkNames {
+		if predicate(item) {
+			ipAddrNetworkNameMatches = append(ipAddrNetworkNameMatches, item)
+		}
+	}
+	return ipAddrNetworkNameMatches
 }
 
 // excludeLocalhostIPs collects ipAddrNetworkNames that have valid IPs, ipv4 or
